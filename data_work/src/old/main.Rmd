@@ -1,0 +1,859 @@
+---
+title: "LLM Annotation Sensitivity -- Main Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r setup-libs}
+library(tidyverse)
+
+setwd("/home/ck/Documents/Uni/Forschung/Article/2026 - LLM Sensitivity/llm-annotation-sensitivity")
+
+source("run_analysis_new.R")
+source("run_table_wide.R")
+source("run_pooled_analysis.R")
+```
+
+## Load Tweet Data
+
+```{r load-data}
+
+folder_path <- "Tweets_CK"
+
+train_df <- read_csv(file.path(folder_path, "full_train_s.csv"))
+test_df  <- read_csv(file.path(folder_path, "full_test_s.csv"))
+
+test_df <- test_df %>% select(all_of(names(train_df)))
+
+tweets_full <- bind_rows(
+  train_df %>% mutate(original_split = "train"),
+  test_df  %>% mutate(original_split = "test")
+) %>%
+  rename(
+    tweet_id = `tweet.id`,
+    hate_speech = `hate.speech`,
+    offensive_language = `offensive.language`
+  )
+
+summary <- tweets_full %>%
+  summarise(
+    OL = mean(offensive_language, na.rm = TRUE),
+    HS = mean(hate_speech, na.rm = TRUE)
+  )
+
+final_summary <- tibble(
+  version = "overall",
+  OL = summary$OL,
+  HS = summary$HS
+)
+
+save(tweets_full, final_summary, file = "tweets_data.RData")
+```
+
+## Load Models
+
+```{r load-models}
+
+load_model <- function(path, model_name) {
+  files <- list.files(path, full.names = TRUE)
+
+  map_df(files, read_csv) %>%
+    arrange(batch_id, tweet_in_batch) %>%
+    mutate(
+      shot = "few-shot",
+      model = model_name
+    )
+}
+
+gpt4    <- load_model("Data_Collection/Models/GPT4o_mini",     "gpt4o_mini")
+gpt54   <- load_model("Data_Collection/Models/GPT5.4",         "gpt5.4")
+llama4  <- load_model("Data_Collection/Models/Llama4",         "llama4")
+mistral <- load_model("Data_Collection/Models/MistralLarge3",  "mistral")
+
+llama31_70b      <- load_model("Data_Collection/Models/Llama3.1_70B_new",    "llama31_70b")
+llama31_8b       <- load_model("Data_Collection/Models/Llama3.1_8B_new",    "llama31_8b")
+mistral_medium35 <- load_model("Data_Collection/Models/MistralMedium3.5_new", "mistral_medium35")
+
+model_keys <- c(
+  "gpt4o_mini", "gpt5.4", "mistral", "mistral_medium35",
+  "llama31_8b", "llama31_70b", "llama4"
+)
+
+model_labels <- c(
+  gpt4o_mini       = "GPT-4o mini",
+  gpt5.4           = "GPT-5.4",
+  mistral          = "Mistral Large 3",
+  mistral_medium35 = "Mistral Medium 3.5",
+  llama31_8b       = "Llama 3.1 8B",
+  llama31_70b      = "Llama 3.1 70B",
+  llama4           = "Llama 4"
+)
+
+model_dfs <- list(
+  gpt4o_mini       = gpt4,
+  gpt5.4           = gpt54,
+  mistral          = mistral,
+  mistral_medium35 = mistral_medium35,
+  llama31_8b       = llama31_8b,
+  llama31_70b      = llama31_70b,
+  llama4           = llama4
+)
+
+save(model_dfs, model_keys, model_labels, file = "model_data.RData")
+```
+
+## Run Prevalence Analyses
+
+```{r prevalence-analyses}
+
+load("tweets_data.RData")
+load("model_data.RData")
+
+prevalence_results <- imap(model_dfs, function(df, key) {
+  run_full_analysis(
+    combined_df   = df,
+    model_name    = key,
+    tweets_full   = tweets_full,
+    final_summary = final_summary
+  )
+})
+
+df_prevalence_all_models <- map_dfr(prevalence_results, "prevalence_data") %>%
+  mutate(
+    model = factor(
+      model_name,
+      levels = model_keys,
+      labels = model_labels[model_keys]
+    )
+  )
+
+saveRDS(df_prevalence_all_models, "df_prevalence_all_models.rds")
+saveRDS(ref_lines, "ref_lines.rds")
+```
+
+```{r prevalence-plot, fig.width=3.5, fig.height=9.5}
+
+df_prevalence_all_models <- readRDS("df_prevalence_all_models.rds")
+ref_lines <- readRDS("ref_lines.rds")
+
+combined_prevalence_plot <- ggplot(
+  df_prevalence_all_models,
+  aes(x = condition_label, y = Value_Pct, color = group_type)
+) +
+
+  geom_hline(
+    data = ref_lines,
+    aes(
+      yintercept = intercept,
+      linetype = "Reference"
+    ),
+    color = "gray50",
+    linewidth = 0.35,
+    show.legend = TRUE
+  ) +
+
+  geom_point(
+    position = position_dodge(width = 0.55),
+    size = 1.6
+  ) +
+
+  facet_grid(
+    model ~ Measure,
+    scales = "fixed",
+    labeller = labeller(
+      Measure = c(OL = "OL", HS = "HS")
+    )
+  ) +
+
+  scale_color_manual(
+    name = "Condition",
+    values = c(
+      "base"       = "#443983",
+      "conf"       = "#31688e",
+      "batch"      = "#35b779",
+      "batch_conf" = "#90d743"
+    ),
+    labels = c(
+      "base"       = "Base",
+      "conf"       = "+ Conf.",
+      "batch"      = "Batch",
+      "batch_conf" = "Batch + Conf."
+    )
+  ) +
+
+  scale_linetype_manual(
+    name = NULL,
+    values = c("Reference" = "dashed")
+  ) +
+
+  scale_y_continuous(
+    limits = c(0, 100),
+    breaks = c(0, 50, 100),
+    expand = expansion(mult = c(0.03, 0.05)),
+    labels = function(x) paste0(x, "%")
+  ) +
+
+  labs(
+    x = "Task Structure",
+    y = "Prevalence"
+  ) +
+
+  guides(
+    color = guide_legend(order = 1, nrow = 2),
+    linetype = guide_legend(order = 2)
+  ) +
+
+  theme_bw(base_size = 8) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(size = 7.5, face = "bold"),
+
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.text = element_text(size = 6.5),
+    legend.title = element_text(size = 7),
+    legend.key.size = unit(0.3, "cm"),
+
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(linewidth = 0.2, color = "gray85"),
+    panel.border = element_rect(color = "gray75", linewidth = 0.3),
+
+    axis.ticks = element_blank(),
+    axis.text.x = element_text(size = 6.5, angle = 0, vjust = 1),
+    axis.text.y = element_text(size = 6.5),
+
+    panel.spacing = unit(0.3, "lines"),
+
+    plot.margin = margin(t = 2, r = 2, b = 12, l = 2)
+  )
+
+combined_prevalence_plot
+
+ggsave(
+  "Plots/combined_prevalences_all_models_acl_halfpage.pdf",
+  combined_prevalence_plot,
+  device = cairo_pdf,
+  width = 8.8,
+  height = 24,
+  units = "cm"
+)
+```
+
+## Prevalence Heatmap (Deviation from Human Reference)
+
+```{r prevalence-heatmap, fig.width=9, fig.height=5}
+
+df_prevalence_all_models <- readRDS("df_prevalence_all_models.rds")
+ref_lines <- readRDS("ref_lines.rds")
+
+group_map <- c(base = "B", conf = "+C", batch = "Bt", batch_conf = "Bt+C")
+cond_map  <- c(
+  "Joint,\nOL first" = "J-OL",
+  "Joint,\nHS first" = "J-HS",
+  "Separate"         = "Sep"
+)
+
+### Fixed 12-column order: 3 conditions x 4 group types, condition-major
+x_level_order <- tidyr::crossing(
+  cond  = factor(names(cond_map),  levels = names(cond_map)),
+  group = factor(names(group_map), levels = names(group_map))
+) %>%
+  mutate(x_label = paste(cond_map[as.character(cond)], group_map[as.character(group)], sep = "\n")) %>%
+  pull(x_label)
+
+measure_full <- c(OL = "Offensive Language", HS = "Hate Speech")
+
+facet_lookup <- ref_lines %>%
+  arrange(Measure) %>%
+  mutate(facet_label = paste0(measure_full[as.character(Measure)], "  (ref=", round(intercept), "%)"))
+
+df_heatmap <- df_prevalence_all_models %>%
+  left_join(ref_lines, by = "Measure") %>%
+  left_join(facet_lookup %>% select(Measure, facet_label), by = "Measure") %>%
+  mutate(
+    deviation   = Value_Pct - intercept,
+    x_label     = factor(
+      paste(cond_map[as.character(condition_label)], group_map[as.character(group_type)], sep = "\n"),
+      levels = x_level_order
+    ),
+    facet_label = factor(facet_label, levels = facet_lookup$facet_label)
+  )
+
+### Symmetric color limits, rounded up to the nearest 5 pts
+dev_limit <- ceiling(max(abs(df_heatmap$deviation), na.rm = TRUE) / 5) * 5
+
+df_heatmap <- df_heatmap %>%
+  mutate(text_color = if_else(abs(deviation) > dev_limit * 0.55, "white", "grey15"))
+
+prevalence_heatmap <- ggplot(
+  df_heatmap,
+  aes(x = x_label, y = fct_rev(model), fill = deviation)
+) +
+
+  geom_tile(color = "white", linewidth = 0.6) +
+
+  geom_text(
+    aes(label = sprintf("%+.0f", deviation), color = text_color),
+    size = 2.5
+  ) +
+
+  geom_vline(xintercept = c(4.5, 8.5), color = "white", linewidth = 1.4) +
+
+  facet_wrap(~ facet_label, nrow = 1) +
+
+  scale_fill_distiller(
+    palette   = "RdBu",
+    direction = -1,
+    limits    = c(-dev_limit, dev_limit),
+    name      = "Deviation from\nreference (pts)"
+  ) +
+
+  scale_color_identity() +
+
+  labs(x = NULL, y = NULL) +
+
+  theme_minimal(base_size = 9) +
+  theme(
+    panel.grid       = element_blank(),
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold", size = 10),
+    axis.text.x      = element_text(size = 6.5, lineheight = 0.85),
+    axis.text.y      = element_text(size = 8),
+    legend.position  = "right"
+  )
+
+prevalence_heatmap
+
+ggsave(
+  "Plots/prevalence_heatmap_all_models.pdf",
+  prevalence_heatmap,
+  device = cairo_pdf,
+  width  = 22,
+  height = 11,
+  units  = "cm"
+)
+```
+
+### Stacked Version (OL Above HS)
+
+```{r prevalence-heatmap-stacked, fig.width=6.5, fig.height=9.5}
+
+prevalence_heatmap_stacked <- prevalence_heatmap +
+  facet_wrap(~ facet_label, ncol = 1, scales = "free_x") +
+  theme(
+    axis.text.x    = element_text(size = 7, lineheight = 0.85),
+    legend.position = "bottom"
+  ) +
+  guides(fill = guide_colorbar(title.position = "top", barwidth = unit(6, "cm")))
+
+prevalence_heatmap_stacked
+
+ggsave(
+  "Plots/prevalence_heatmap_all_models_stacked.pdf",
+  prevalence_heatmap_stacked,
+  device = cairo_pdf,
+  width  = 16,
+  height = 24,
+  units  = "cm"
+)
+```
+
+### Flipped Axis (Model on X, Condition on Y)
+
+```{r prevalence-heatmap-flipped, fig.width=8, fig.height=8}
+
+prevalence_heatmap_flipped <- ggplot(
+  df_heatmap,
+  aes(x = model, y = fct_rev(x_label), fill = deviation)
+) +
+
+  geom_tile(color = "white", linewidth = 0.6) +
+
+  geom_text(
+    aes(label = sprintf("%+.0f", deviation), color = text_color),
+    size = 2.5
+  ) +
+
+  geom_hline(yintercept = c(4.5, 8.5), color = "white", linewidth = 1.4) +
+
+  facet_wrap(~ facet_label, nrow = 1) +
+
+  scale_fill_distiller(
+    palette   = "RdBu",
+    direction = -1,
+    limits    = c(-dev_limit, dev_limit),
+    name      = "Deviation from\nreference (pts)"
+  ) +
+
+  scale_color_identity() +
+
+  labs(x = NULL, y = NULL) +
+
+  theme_minimal(base_size = 9) +
+  theme(
+    panel.grid       = element_blank(),
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold", size = 10),
+    axis.text.x      = element_text(size = 7, angle = 30, hjust = 1),
+    axis.text.y      = element_text(size = 6.5, lineheight = 0.85),
+    legend.position  = "right"
+  )
+
+prevalence_heatmap_flipped
+
+ggsave(
+  "Plots/prevalence_heatmap_all_models_flipped.pdf",
+  prevalence_heatmap_flipped,
+  device = cairo_pdf,
+  width  = 20,
+  height = 20,
+  units  = "cm"
+)
+```
+
+### Flipped Axis, Stacked
+
+```{r prevalence-heatmap-flipped-stacked, fig.width=6.5, fig.height=14}
+
+### Spelled-out condition labels, just for this (roomier) version
+cond_map_long  <- c("J-OL" = "Joint (OL first)", "J-HS" = "Joint (HS first)", "Sep" = "Separate")
+group_map_long <- c("B" = "Base", "+C" = "+ Confidence", "Bt" = "Batch", "Bt+C" = "Batch + Confidence")
+
+x_label_long_lookup <- tidyr::crossing(
+  cond  = factor(names(cond_map),  levels = names(cond_map)),
+  group = factor(names(group_map), levels = names(group_map))
+) %>%
+  mutate(
+    short = paste(cond_map[as.character(cond)],       group_map[as.character(group)],       sep = "\n"),
+    long  = paste(cond_map_long[cond_map[as.character(cond)]], group_map_long[group_map[as.character(group)]], sep = "\n")
+  )
+
+x_label_long_map <- setNames(x_label_long_lookup$long, x_label_long_lookup$short)
+
+prevalence_heatmap_flipped_stacked <- prevalence_heatmap_flipped +
+  facet_wrap(~ facet_label, ncol = 1, scales = "free_x") +
+  scale_y_discrete(labels = x_label_long_map) +
+  theme(
+    axis.text.x    = element_text(size = 7.5, angle = 30, hjust = 1),
+    axis.text.y    = element_text(size = 6.5, lineheight = 1.0),
+    legend.position = "bottom"
+  ) +
+  guides(fill = guide_colorbar(
+    title.position = "top", barwidth = unit(6, "cm")
+  ))
+
+prevalence_heatmap_flipped_stacked
+
+ggsave(
+  "Plots/prevalence_heatmap_all_models_flipped_stacked.pdf",
+  prevalence_heatmap_flipped_stacked,
+  device = cairo_pdf,
+  width  = 14,
+  height = 24,
+  units  = "cm"
+)
+```
+
+## Prevalence Heatmap (Deviation from Each Model's Own Mean)
+
+```{r prevalence-heatmap-model-mean-stacked, fig.width=6.5, fig.height=14}
+
+measure_only_label <- c(OL = "Offensive Language", HS = "Hate Speech")
+
+df_heatmap_mm <- df_heatmap %>%
+  group_by(model, Measure) %>%
+  mutate(
+    model_mean      = mean(Value_Pct, na.rm = TRUE),
+    deviation_model = Value_Pct - model_mean
+  ) %>%
+  ungroup() %>%
+  mutate(facet_label_mm = factor(measure_only_label[as.character(Measure)], levels = measure_only_label))
+
+### Symmetric color limits, rounded up to the nearest 5 pts
+dev_limit_mm <- ceiling(max(abs(df_heatmap_mm$deviation_model), na.rm = TRUE) / 5) * 5
+
+df_heatmap_mm <- df_heatmap_mm %>%
+  mutate(text_color_mm = if_else(abs(deviation_model) > dev_limit_mm * 0.55, "white", "grey15"))
+
+### Spelled-out, two-line condition labels (reuses cond_map_long / group_map_long
+### and x_label_long_lookup built for the flipped-stacked version above)
+x_label_long_map <- setNames(x_label_long_lookup$long, x_label_long_lookup$short)
+
+prevalence_heatmap_model_mean_stacked <- ggplot(
+  df_heatmap_mm,
+  aes(x = model, y = fct_rev(x_label), fill = deviation_model)
+) +
+
+  geom_tile(color = "white", linewidth = 0.6) +
+
+  geom_text(
+    aes(label = sprintf("%+.0f", deviation_model), color = text_color_mm),
+    size = 2.5
+  ) +
+
+  geom_hline(yintercept = c(4.5, 8.5), color = "white", linewidth = 1.4) +
+
+  facet_wrap(~ facet_label_mm, ncol = 1, scales = "free_x") +
+
+  scale_y_discrete(labels = x_label_long_map) +
+
+  scale_fill_distiller(
+    palette   = "RdBu",
+    direction = -1,
+    limits    = c(-dev_limit_mm, dev_limit_mm),
+    name      = "Deviation from\nmodel's own mean (pts)"
+  ) +
+
+  scale_color_identity() +
+
+  labs(x = NULL, y = NULL) +
+
+  guides(fill = guide_colorbar(
+    title.position = "top", barwidth = unit(6, "cm")
+  )) +
+
+  theme_minimal(base_size = 9) +
+  theme(
+    panel.grid       = element_blank(),
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold", size = 10),
+    axis.text.x      = element_text(size = 7.5, angle = 30, hjust = 1),
+    axis.text.y      = element_text(size = 6.5, lineheight = 1.0),
+    legend.position  = "bottom"
+  )
+
+prevalence_heatmap_model_mean_stacked
+
+ggsave(
+  "Plots/prevalence_heatmap_all_models_vs_model_mean_stacked.pdf",
+  prevalence_heatmap_model_mean_stacked,
+  device = cairo_pdf,
+  width  = 14,
+  height = 24,
+  units  = "cm"
+)
+```
+
+## Agreement Analyses (Kappa Heatmaps, All Models)
+
+```{r agreement-analyses}
+source("R1c_Agreements_AllModels.R")
+
+load("tweets_data.RData")
+load("model_data.RData")
+
+agreement_results <- imap(model_dfs, function(df, key) {
+  df_long_model <- run_full_analysis(
+    combined_df   = df,
+    model_name    = key,
+    tweets_full   = tweets_full,
+    final_summary = final_summary
+  )$df_long
+
+  run_agreement_analysis(
+    df_long     = df_long_model,
+    model_name  = key,
+    tweets_full = tweets_full
+  )
+})
+
+df_agreement_all_models <- map_dfr(agreement_results, "heat_df") %>%
+  mutate(
+    model = factor(
+      model_name,
+      levels = model_keys,
+      labels = model_labels[model_keys]
+    )
+  )
+
+saveRDS(df_agreement_all_models, "df_agreement_all_models.rds")
+saveRDS(agreement_results, "agreement_results.rds")
+```
+
+```{r agreement-plot, fig.width=6.7, fig.height=8.7}
+
+df_agreement_all_models <- readRDS("df_agreement_all_models.rds")
+
+coolwarm <- colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdBu")))
+
+task_map <- c(A = "Joint, OL first", B = "Joint, HS first", C = "Separate")
+
+### nested condition labels: task name shown once per block, mode below it
+nested_cond_label <- function(x) {
+  task_p <- str_extract(x, "^[ABC]")
+  occ    <- ave(seq_along(x), task_p, FUN = seq_along)
+  mode_p <- case_when(
+    x == "gap"                 ~ "",
+    x == "reference_agreement" ~ "Ref.",
+    grepl("batch_conf", x)     ~ "batch+conf",
+    grepl("batch", x)          ~ "batch",
+    grepl("conf", x)           ~ "conf",
+    TRUE                       ~ "base"
+  )
+  task_disp <- ifelse(occ == 1 & !is.na(task_p), paste0(task_map[task_p], " "), "")
+  paste0(task_disp, mode_p)
+}
+
+agreement_heatmap_all_models <- ggplot(
+  df_agreement_all_models,
+  aes(x = col_cond, y = row_cond, fill = value)
+) +
+
+  geom_tile(colour = "white", linewidth = 0.25) +
+
+  geom_text(
+    aes(label = ifelse(is.na(value), "",
+                        sub("^(-?)0\\.", "\\1.", sprintf("%.2f", value)))),
+    size = 1.5
+  ) +
+
+  ### rows = model, columns = OL / HS
+  facet_grid(model ~ outcome) +
+
+  scale_y_discrete(limits = rev, labels = nested_cond_label) +
+  scale_x_discrete(labels = nested_cond_label) +
+
+  scale_fill_gradientn(
+    colours  = coolwarm(100),
+    limits   = c(0, 1),
+    na.value = "white",
+    name     = "Kappa"
+  ) +
+
+  labs(x = NULL, y = NULL) +
+
+  theme_minimal(base_size = 6) +
+  theme(
+    panel.grid      = element_blank(),
+    axis.text.x     = element_text(size = 4, angle = 90, hjust = 1, vjust = 0.5),
+    axis.text.y     = element_text(size = 4),
+    strip.text.y    = element_text(size = 5.5, face = "bold", angle = -90),
+    strip.text.x    = element_text(size = 6.5, face = "bold"),
+    panel.spacing   = unit(0.15, "lines"),
+    legend.position = "bottom",
+    legend.key.height = unit(0.25, "cm"),
+    legend.key.width  = unit(0.6, "cm"),
+    legend.title    = element_text(size = 6.5),
+    legend.text     = element_text(size = 5.5)
+  )
+
+agreement_heatmap_all_models
+
+### sized for ACL's double-column (\textwidth) figure, ~1 page tall
+ggsave(
+  "Plots/agreements_few_all_models.pdf",
+  agreement_heatmap_all_models,
+  device = cairo_pdf,
+  width  = 17,
+  height = 22,
+  units  = "cm"
+)
+```
+
+### Table -- Within-Condition Agreement Only (Diagonal)
+
+```{r agreement-diag-table}
+source("R1c_Agreements_AllModels.R")
+source("run_table_wide.R")
+
+load("model_data.RData")
+agreement_results <- readRDS("agreement_results.rds")
+
+table_agreement_diag_split <- build_agreement_diag_table_split(
+  agreement_results = agreement_results,
+  model_order        = model_keys,
+  model_labels       = model_labels
+)
+
+write_csv(table_agreement_diag_split$OL, "Plots/table_agreement_within_condition_OL.csv")
+write_csv(table_agreement_diag_split$HS, "Plots/table_agreement_within_condition_HS.csv")
+
+agreement_diag_standalone_tex <- agreement_diag_split_to_standalone_tex(
+  table_agreement_diag_split, model_labels[model_keys]
+)
+writeLines(agreement_diag_standalone_tex, "Plots/table_agreement_within_condition_standalone.tex")
+
+table_agreement_diag_split$OL
+table_agreement_diag_split$HS
+```
+
+## Run Individual LPM Models
+
+```{r lpm-models}
+source("run_inference_analysis_v2.R")
+
+load("model_data.RData")
+
+lpm_results <- imap(model_dfs, function(df, key) {
+  run_inference_analysis(
+    combined_df = df,
+    model_name  = key
+  )
+})
+
+saveRDS(lpm_results, "lpm_results.rds")
+```
+
+## Table -- Wide, All 7 Models
+
+```{r table-wide}
+
+lpm_results <- readRDS("lpm_results.rds")
+load("model_data.RData")
+
+table1_wide <- build_wide_table(
+  lpm_results  = lpm_results,
+  model_order  = model_keys,
+  model_labels = model_labels
+)
+
+write_csv(table1_wide, "Plots/model_lpm_tables/table1_wide_7models.csv")
+
+table1_wide_latex <- wide_table_to_latex(table1_wide, model_labels[model_keys])
+writeLines(table1_wide_latex, "Plots/model_lpm_tables/table1_wide_7models_latex.txt")
+
+table1_wide_standalone_tex <- wide_table_to_standalone_tex(table1_wide, model_labels[model_keys])
+writeLines(table1_wide_standalone_tex, "Plots/model_lpm_tables/table1_wide_7models_standalone.tex")
+
+table1_wide
+```
+
+## Table -- Pooled Models, LPMs
+
+```{r pooled-lpm-fit}
+
+load("model_data.RData")
+
+pooled_results <- run_pooled_analysis(
+  model_dfs    = model_dfs,
+  model_labels = model_labels
+)
+
+saveRDS(pooled_results, "Plots/combined_inference/pooled_results_lpm.rds")
+```
+
+```{r table-pooled}
+
+pooled_results <- readRDS("Plots/combined_inference/pooled_results_lpm.rds")
+pooled_dir <- "Plots/combined_inference"
+
+write_csv(pooled_results$combined_paper_table, file.path(pooled_dir, "combined_LPM_paper_table.csv"))
+
+pooled_latex <- combined_pooled_table_to_latex(pooled_results$combined_paper_table, pooled_results$model_level_labels)
+writeLines(pooled_latex, file.path(pooled_dir, "combined_LPM_latex_rows.txt"))
+
+pooled_standalone_tex <- combined_pooled_table_to_standalone_tex(
+  pooled_results$combined_paper_table,
+  model_level_labels = pooled_results$model_level_labels,
+  reference_label = pooled_results$reference_label
+)
+writeLines(pooled_standalone_tex, file.path(pooled_dir, "combined_LPM_standalone.tex"))
+
+write_csv(pooled_results$combined_paper_table_randomslopes, file.path(pooled_dir, "combined_LPM_randomslopes_paper_table.csv"))
+
+pooled_randomslopes_latex <- combined_pooled_table_randomslopes_to_latex(pooled_results$combined_paper_table_randomslopes, pooled_results$model_level_labels)
+writeLines(pooled_randomslopes_latex, file.path(pooled_dir, "combined_LPM_randomslopes_latex_rows.txt"))
+
+pooled_randomslopes_standalone_tex <- combined_pooled_table_randomslopes_to_standalone_tex(
+  pooled_results$combined_paper_table_randomslopes,
+  model_level_labels = pooled_results$model_level_labels,
+  reference_label = pooled_results$reference_label
+)
+writeLines(pooled_randomslopes_standalone_tex, file.path(pooled_dir, "combined_LPM_randomslopes_standalone.tex"))
+
+pooled_results$combined_paper_table
+pooled_results$combined_paper_table_randomslopes
+```
+
+## Table -- Pooled Models, Mixed-Effects Logistic Regression
+
+```{r pooled-logit-fit-base}
+
+load("model_data.RData")
+
+pooled_logit_base <- fit_pooled_base(
+  model_dfs    = model_dfs,
+  model_labels = model_labels,
+  family       = "binomial"
+)
+
+saveRDS(pooled_logit_base, "Plots/combined_inference/pooled_logit_base.rds")
+rm(model_dfs); gc()
+```
+
+```{r table-pooled-logit-base-only}
+
+pooled_logit_base <- readRDS("Plots/combined_inference/pooled_logit_base.rds")
+pooled_logit_dir <- "Plots/combined_inference"
+
+pooled_results_logit_base_only <- combine_pooled_results_base_only(pooled_logit_base)
+
+pooled_logit_base_only_standalone_tex <- combined_pooled_table_base_to_standalone_tex(
+  pooled_results_logit_base_only$combined_paper_table,
+  model_level_labels = pooled_results_logit_base_only$model_level_labels,
+  reference_label = pooled_results_logit_base_only$reference_label
+)
+writeLines(pooled_logit_base_only_standalone_tex, file.path(pooled_logit_dir, "combined_logit_base_only_standalone.tex"))
+```
+
+```{r pooled-logit-fit-interaction}
+
+pooled_logit_base <- readRDS("Plots/combined_inference/pooled_logit_base.rds")
+
+pooled_logit_interaction <- fit_pooled_interaction(pooled_logit_base, n_cores = 2)
+
+saveRDS(pooled_logit_interaction, "Plots/combined_inference/pooled_logit_interaction.rds")
+rm(pooled_logit_base, pooled_logit_interaction); gc()
+```
+
+```{r pooled-logit-fit-designinteraction}
+
+pooled_logit_base <- readRDS("Plots/combined_inference/pooled_logit_base.rds")
+
+pooled_logit_designinteraction <- fit_pooled_design_interaction(pooled_logit_base, n_cores = 2)
+
+saveRDS(pooled_logit_designinteraction, "Plots/combined_inference/pooled_logit_designinteraction.rds")
+rm(pooled_logit_base, pooled_logit_designinteraction); gc()
+```
+
+```{r pooled-logit-combine}
+
+pooled_logit_base <- readRDS("Plots/combined_inference/pooled_logit_base.rds")
+pooled_logit_interaction <- readRDS("Plots/combined_inference/pooled_logit_interaction.rds")
+pooled_logit_designinteraction <- readRDS("Plots/combined_inference/pooled_logit_designinteraction.rds")
+
+pooled_results_logit <- combine_pooled_results(
+  base               = pooled_logit_base,
+  interaction        = pooled_logit_interaction,
+  design_interaction = pooled_logit_designinteraction
+)
+
+saveRDS(pooled_results_logit, "Plots/combined_inference/pooled_results_logit.rds")
+rm(pooled_logit_base, pooled_logit_interaction, pooled_logit_designinteraction); gc()
+```
+
+```{r table-pooled-logit}
+
+pooled_results_logit <- readRDS("Plots/combined_inference/pooled_results_logit.rds")
+pooled_logit_dir <- "Plots/combined_inference"
+
+write_csv(pooled_results_logit$combined_paper_table, file.path(pooled_logit_dir, "combined_logit_paper_table.csv"))
+
+pooled_logit_latex <- combined_pooled_table_logit_to_latex(pooled_results_logit$combined_paper_table, pooled_results_logit$model_level_labels)
+writeLines(pooled_logit_latex, file.path(pooled_logit_dir, "combined_logit_latex_rows.txt"))
+
+pooled_logit_standalone_tex <- combined_pooled_table_logit_to_standalone_tex(
+  pooled_results_logit$combined_paper_table,
+  model_level_labels = pooled_results_logit$model_level_labels,
+  reference_label = pooled_results_logit$reference_label
+)
+writeLines(pooled_logit_standalone_tex, file.path(pooled_logit_dir, "combined_logit_standalone.tex"))
+
+pooled_results_logit$combined_paper_table
+```
